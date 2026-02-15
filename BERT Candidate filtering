@@ -1,0 +1,134 @@
+
+# Geocoding setup
+
+geolocator = Nominatim(user_agent="bert_geoparse_app", timeout=10)
+geocode_rate_limited = RateLimiter(
+    geolocator.geocode,
+    min_delay_seconds=2,
+    max_retries=3,
+    error_wait_seconds=5
+)
+
+
+# Candidate filtering
+#distance
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance (m) between two lat/lon points."""
+    R = 6371000.0  # Earth radius in meters
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def is_valid_location(name):
+    """Skip too-short or non-alphabetic names."""
+    return len(name) > 3 and any(char.isalpha() for char in name)
+
+def bert_geoparse(text):
+    """Extract place mentions from text using BERT NER, deduplicated."""
+    ner_results = ner_pipeline(text)
+    places = []
+    for ent in ner_results:
+        if ent['entity_group'] in ['LOC', 'GPE', 'ORG', 'FAC']:
+            places.append(ent['word'])
+    # Deduplicate preserving order
+    seen, uniq = set(), []
+    for p in places:
+        lp = p.lower()
+        if lp not in seen:
+            seen.add(lp)
+            uniq.append(p)
+    return uniq
+
+def geocode_place(place, country_codes=None, proximity_point=None, max_candidates=5):
+    """Return up to N geocoding candidates, sorted by distance or importance."""
+    kwargs = {"exactly_one": False, "limit": max_candidates}
+    if country_codes:
+        kwargs["country_codes"] = ",".join(country_codes)
+    try:
+        results = geocode_rate_limited(place, **kwargs)
+    except:
+        return []
+    if not results:
+        return []
+    if not isinstance(results, list):
+        results = [results]
+    candidates = []
+    for loc in results:
+        lat, lon = float(loc.latitude), float(loc.longitude)
+        cand = {
+            "display_name": loc.address,
+            "lat": lat,
+            "lon": lon,
+            "importance": float(loc.raw.get("importance", 0))
+        }
+        if proximity_point:
+            cand["distance_m"] = haversine_distance(proximity_point[0], proximity_point[1], lat, lon)
+        else:
+            cand["distance_m"] = None
+        candidates.append(cand)
+    # Sort by distance if proximity provided, else by importance
+    if proximity_point:
+        candidates.sort(key=lambda c: (c["distance_m"] if c["distance_m"] else 1e12, -c["importance"]))
+    else:
+        candidates.sort(key=lambda c: -c["importance"])
+    return candidates
+
+def bert_geoparse_and_geocode(text, context=None):
+    """
+    Extract mentions and geocode them with context.
+    Skips invalid locations.
+    Returns structured list of mentions + candidates.
+    """
+    if context is None:
+        context = {}
+
+    mentions = bert_geoparse(text)
+    results = []
+
+    for m in mentions:
+        if not is_valid_location(m):
+            continue
+
+        candidates = geocode_place(
+            m,
+            country_codes=context.get("country_codes"),
+            proximity_point=context.get("proximity_point"),
+            max_candidates=context.get("max_candidates", 5)
+        )
+
+        results.append({"mention": m, "candidates": candidates})
+
+    return results
+
+# Process tweets
+
+all_results = []
+
+for _, row in df.iterrows():
+    text = row["text"]
+    tweet_id = row.get("id", None)
+
+    print(f"\ Processing Tweet ID {tweet_id}: {text[:80]}...")
+
+    try:
+        parsed = bert_geoparse_and_geocode(
+            text,
+            context={"country_codes": ["us"], "max_candidates": 3}
+        )
+        for item in parsed:
+            mention = item["mention"]
+            for cand in item["candidates"]:
+                all_results.append({
+                    "tweet_id": tweet_id,
+                    "mention": mention,
+                    "display_name": cand["display_name"],
+                    "lat": cand["lat"],
+                    "lon": cand["lon"],
+                    "importance": cand["importance"],
+                    "distance_m": cand["distance_m"]
+                })
+    except Exception as e:
+        print(f"❌ Error processing tweet {tweet_id}: {e}")
