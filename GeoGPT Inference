@@ -1,0 +1,76 @@
+#prompt design
+def gpt_geoparse(text):
+    prompt = f"""
+You are a geolocation classification assistant. 
+Read the tweet carefully and assign it to exactly ONE of the following location categories based on the type of location mentioned.
+
+C1 = Door number addresses
+C2 = Street names
+C3 = Highways
+C4 = Exits of highways
+C5 = Intersections of roads or rivers
+C6 = Natural features
+C7 = Other human-made features
+C8 = Local organizations
+C9 = Administrative units
+C10 = Multiple areas
+C11 = Road segments
+
+Tweet: {text}
+
+Return your answer in JSON format only:
+{{
+  "category": "C#",
+  "location_name": "the location text to geocode",
+  "reason": "brief explanation"
+}}
+"""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("GPT Error:", e)
+        return '{"category": "Unknown", "location_name": "", "reason": "Error"}'
+
+#batch
+def batch_geoparse(input_file, text_column, output_file):
+    # Read JSON and select only first 1000 rows
+    df = pd.read_json(input_file, lines=True).iloc[1001:3992]
+    print(f"Loaded {len(df)} tweets for processing.")
+
+    results = []
+
+    for idx, text in enumerate(df[text_column]):
+        print(f"\n[{idx+1001}/{1001+len(df)}] Processing tweet: {text[:60]}...")
+        
+        gpt_output = gpt_geoparse(text)
+
+        try:
+            result = json.loads(gpt_output)
+            category = result.get("category", "Unknown")
+            location_name = result.get("location_name", "")
+            reason = result.get("reason", "")
+        except:
+            category = "Unknown"
+            location_name = ""
+            reason = "Parsing failed"
+
+        geo = geocode_place(location_name)
+
+        results.append({
+            "tweet_index": idx,
+            "tweet_text": text,
+            "category": category,
+            "location_name": location_name,
+            "reason": reason,
+            "latitude": geo["latitude"],
+            "longitude": geo["longitude"],
+            "address": geo["address"]
+        })
+
+        # Avoid overloading the API
+        time.sleep(1)
